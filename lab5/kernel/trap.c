@@ -16,6 +16,66 @@ void kernelvec();
 
 extern int devintr();
 
+int isCOWPG(pagetable_t pg, uint64 va)
+{
+  if (va > MAXVA)
+    return -1;
+  pte_t *pte = walk(pg, va, 0);
+  if (pte == 0)
+    return 0;
+  if ((*pte & PTE_V) == 0)
+    return 0;
+  if ((*pte & PTE_COW))
+    return 1;
+  return 0;
+}
+
+void *allocCOWPG(pagetable_t pg, uint64 va)
+{
+  va = PGROUNDDOWN(va);
+  if (va % PGSIZE != 0 || va > MAXVA)
+    return 0;
+
+  uint64 pa = walkaddr(pg, va);
+  if (pa == 0)
+    return 0;
+
+  pte_t *pte = walk(pg, va, 0);
+  if (pte == 0)
+    return 0;
+
+  int count = GetPGRefCount((void *)pa);
+  if (count == 1)
+  {
+    // 只有一个进程在使用当前页，设置为可写并将COW标志位复位
+    *pte = (*pte & ~PTE_COW) | PTE_W;
+    return (void *)pa;
+  }
+  else
+  {
+    // 有多个进程在使用当前页，需要分配新的物理页
+    char *mem = kalloc();
+    if (mem == 0)
+      return 0;
+
+    memmove(mem, (char *)pa, PGSIZE);
+
+    // 清除有效位PTE_V，否则在mappagges中会出错
+    *pte = (*pte) & ~PTE_V;
+
+    if (mappages(pg, va, PGSIZE, (uint64)mem, (PTE_FLAGS(*pte) & ~PTE_COW) | PTE_W) != 0)
+    {
+      kfree(mem);
+      *pte = (*pte) | PTE_V;
+      return 0;
+    }
+
+    kfree((void *)PGROUNDDOWN(pa));
+
+    return (void *)mem;
+  }
+}
+
 void trapinit(void)
 {
   initlock(&tickslock, "time");
@@ -64,12 +124,12 @@ void usertrap(void)
 
     syscall();
   }
-  else if (r_scause() == 15)
+  // 异常代码15：Fault Fetch（缺页错误）
+  // 异常代码13：Misaligned Fetch（对齐错误）
+  else if (r_scause() == 13 || r_scause() == 15)
   {
     uint64 va = r_stval();
-    if (va >= p->sz)
-      p->killed = 1;
-    else if (cow_alloc(p->pagetable, va) != 0)
+    if (va >= p->sz || isCOWPG(p->pagetable, va) != 1 || allocCOWPG(p->pagetable, va) == 0)
       p->killed = 1;
   }
   else if ((which_dev = devintr()) != 0)
@@ -80,10 +140,10 @@ void usertrap(void)
   {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    setkilled(p);
   }
 
-  if (p->killed)
+  if (killed(p))
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.

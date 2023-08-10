@@ -14,7 +14,6 @@ void freerange(void *pa_start, void *pa_end);
 extern char end[]; // first address after kernel.
                    // defined by kernel.ld.
 
-uint page_ref[(PHYSTOP - KERNBASE) / PGSIZE];
 extern uint page_ref[]; // kalloc.c
 
 struct run
@@ -28,9 +27,16 @@ struct
   struct run *freelist;
 } kmem;
 
+struct refcnt
+{
+  struct spinlock lock;
+  int PGCount[PHYSTOP / PGSIZE]; // (最大页数 = 地址空间大小/页大小)
+} PGRefCount;
+
 void kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&PGRefCount.lock, "PGRefCount"); // 初始化PGRefCount锁
   freerange(end, (void *)PHYSTOP);
 }
 
@@ -39,7 +45,11 @@ void freerange(void *pa_start, void *pa_end)
   char *p;
   p = (char *)PGROUNDUP((uint64)pa_start);
   for (; p + PGSIZE <= (char *)pa_end; p += PGSIZE)
+  {
+    // 所有页的PGCount值均设为1，使其在后续过沉重可以正常进行释放
+    PGRefCount.PGCount[(uint64)p / PGSIZE] = 1;
     kfree(p);
+  }
 }
 
 // Free the page of physical memory pointed at by v,
@@ -53,15 +63,15 @@ void kfree(void *pa)
   if (((uint64)pa % PGSIZE) != 0 || (char *)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // acquire(&ref_lock);
-  if (page_ref[COW_INDEX(pa)] > 1)
+  acquire(&PGRefCount.lock);
+  PGRefCount.PGCount[(uint64)pa / PGSIZE]--;
+
+  if (PGRefCount.PGCount[(uint64)pa / PGSIZE] != 0)
   {
-    page_ref[COW_INDEX(pa)]--;
-    // release(&ref_lock);
+    release(&PGRefCount.lock);
     return;
   }
-  page_ref[COW_INDEX(pa)] = 0;
-  // release(&ref_lock);
+  release(&PGRefCount.lock);
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -77,8 +87,7 @@ void kfree(void *pa)
 // Allocate one 4096-byte page of physical memory.
 // Returns a pointer that the kernel can use.
 // Returns 0 if the memory cannot be allocated.
-void *
-kalloc(void)
+void *kalloc(void)
 {
   struct run *r;
 
@@ -88,40 +97,36 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
+  // pgcount初值赋为1
   if (r)
   {
-    memset((char *)r, 5, PGSIZE); // fill with junk
-    page_ref[COW_INDEX(r)] = 1;
+    acquire(&PGRefCount.lock);
+    PGRefCount.PGCount[(uint64)r / PGSIZE] = 1;
+    release(&PGRefCount.lock);
   }
+
+  if (r)
+    memset((char *)r, 5, PGSIZE); // fill with junk
   return (void *)r;
 }
 
-int cow_alloc(pagetable_t pagetable, uint64 va)
+int AddPGRefCount(void *pa)
 {
-  va = PGROUNDDOWN(va);
-  if (va >= MAXVA)
-    return -1;
-  pte_t *pte = walk(pagetable, va, 0);
-  if (pte == 0)
-    return -1;
-  uint64 pa = PTE2PA(*pte);
-  if (pa == 0)
-    return -1;
-  uint64 flags = PTE_FLAGS(*pte);
-  if (flags & PTE_COW)
+  if (((uint64)pa % PGSIZE))
   {
-    uint64 mem = (uint64)kalloc();
-    if (mem == 0)
-      return -1;
-    memmove((char *)mem, (char *)pa, PGSIZE);
-    uvmunmap(pagetable, va, 1, 1);
-    flags = (flags | PTE_W) & ~PTE_COW;
-    //*pte = PA2PTE(mem) | flags;
-    if (mappages(pagetable, va, PGSIZE, mem, flags) != 0)
-    {
-      kfree((void *)mem);
-      return -1;
-    }
+    return -1;
   }
+  if ((char *)pa < end || (uint64)pa >= PHYSTOP)
+  {
+    return -1;
+  }
+  acquire(&PGRefCount.lock);
+  PGRefCount.PGCount[(uint64)pa / PGSIZE]++;
+  release(&PGRefCount.lock);
   return 0;
+}
+
+int GetPGRefCount(void *pa)
+{
+  return PGRefCount.PGCount[(uint64)pa / PGSIZE];
 }

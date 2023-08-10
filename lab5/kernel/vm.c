@@ -311,29 +311,33 @@ int uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  // char *mem;
+
   for (i = 0; i < sz; i += PGSIZE)
   {
     if ((pte = walk(old, i, 0)) == 0)
       panic("uvmcopy: pte should exist");
     if ((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
+
     pa = PTE2PA(*pte);
-    *pte = (*pte & ~PTE_W) | PTE_COW;
+
+    *pte = (*pte & ~PTE_W) | PTE_COW; // 将所有的pte的写权限都设置为0，PTE_COW设置为1
+
     flags = PTE_FLAGS(*pte);
-    // if((mem = kalloc()) == 0)
-    //  goto err;
-    // memmove(mem, (char*)pa, PGSIZE);
+
     if (mappages(new, i, PGSIZE, pa, flags) != 0)
     {
-      // kfree(mem);
       goto err;
     }
-    // acquire(&ref_lock);
-    page_ref[COW_INDEX(pa)]++;
-    // release(&ref_lock);
+
+    // 索引计数加1
+    if (AddPGRefCount((void *)pa))
+    {
+      goto err;
+    }
   }
   return 0;
+
 err:
   uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
@@ -357,22 +361,23 @@ void uvmclear(pagetable_t pagetable, uint64 va)
 int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
-  pte_t *pte;
 
   while (len > 0)
   {
     va0 = PGROUNDDOWN(dstva);
-    if (cow_alloc(pagetable, va0) != 0)
-      return -1;
     pa0 = walkaddr(pagetable, va0);
+
+    // 若是COW页，则要分配新的物理页再复制
+    if (isCOWPG(pagetable, va0) == 1)
+    {
+      pa0 = (uint64)allocCOWPG(pagetable, va0);
+    }
+
     if (pa0 == 0)
       return -1;
     n = PGSIZE - (dstva - va0);
     if (n > len)
       n = len;
-    pte = walk(pagetable, va0, 0);
-    if (pte == 0)
-      return -1;
     memmove((void *)(pa0 + (dstva - va0)), src, n);
 
     len -= n;

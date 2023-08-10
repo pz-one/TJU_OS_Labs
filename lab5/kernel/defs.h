@@ -63,7 +63,8 @@ void            ramdiskrw(struct buf*);
 void*           kalloc(void);
 void            kfree(void *);
 void            kinit(void);
-int             cow_alloc(pagetable_t, uint64);
+int             AddPGRefCount(void *);
+int             GetPGRefCount(void *);
 
 // log.c
 void            initlog(int, struct superblock*);
@@ -91,6 +92,8 @@ void            proc_mapstacks(pagetable_t);
 pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
 int             kill(int);
+int             killed(struct proc *);
+void            setkilled(struct proc *);
 struct cpu*     mycpu(void);
 struct cpu*     getmycpu(void);
 struct proc*    myproc();
@@ -146,6 +149,8 @@ void            trapinit(void);
 void            trapinithart(void);
 extern struct spinlock tickslock;
 void            usertrapret(void);
+int             isCOWPG(pagetable_t pg, uint64 va);
+void            *allocCOWPG(pagetable_t pg, uint64 va);
 
 // uart.c
 void            uartinit(void);
